@@ -1,0 +1,15 @@
+{application, cuckoo_cache, [
+    {description,
+        "A high-performance concurrent in-memory cache with one-hit-wonders detection for Erlang and Elixir"},
+    {vsn, "0.0.1"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib
+    ]},
+    {env, []},
+    {modules, []},
+
+    {licenses, ["Apache 2.0"]},
+    {links, [{"Github", "https://github.com/farhadi/cuckoo_cache"}]}
+]}.
