@@ -14,7 +14,7 @@
     delete/2,
     capacity/1,
     filter_size/1,
-    table_size/1
+    size/1
 ]).
 
 -include("cuckoo_cache.hrl").
@@ -231,17 +231,17 @@ filter_size(Name) ->
     filter_size(?CACHE(Name)).
 
 %% @doc Returns number of items in the ets table of a cache.
--spec table_size(cuckoo_cache() | cache_name()) -> non_neg_integer().
-table_size(#cuckoo_cache{table = Table}) ->
+-spec size(cuckoo_cache() | cache_name()) -> non_neg_integer().
+size(#cuckoo_cache{table = Table}) ->
     ets:info(Table, size);
-table_size(Name) ->
-    table_size(?CACHE(Name)).
+size(Name) ->
+    cuckoo_cache:size(?CACHE(Name)).
 
 %%%-------------------------------------------------------------------
 %% Internal functions
 %%%-------------------------------------------------------------------
 
--spec add_hash(cuckoo_cache(), hash()) -> ok | {ok, Evicted :: fingerprint()}.
+-spec add_hash(cuckoo_cache(), hash()) -> ok.
 add_hash(
     Cache = #cuckoo_cache{
         fingerprint_size = FingerprintSize,
@@ -317,25 +317,9 @@ do_put(
 ) ->
     Hash = hash(Cache, Key),
     Fingerprint = fingerprint(Hash, FingerprintSize),
-    add_new(Cache, Hash),
+    add_hash(Cache, Hash),
     ets:insert(Table, {Fingerprint, Key, Value, Expiry}),
     ok.
-
--spec add_new(cuckoo_cache(), hash()) ->
-    ok | {ok, Evicted :: fingerprint()} | {error, already_exists}.
-add_new(Cache = #cuckoo_cache{table = Table}, Hash) ->
-    case contains_hash(Cache, Hash) of
-        true ->
-            {error, already_exists};
-        false ->
-            case add_hash(Cache, Hash) of
-                ok ->
-                    ok;
-                {ok, Removed} ->
-                    ets:delete(Table, Removed),
-                    {ok, Removed}
-            end
-    end.
 
 -spec do_fetch(cuckoo_cache(), key(), fallback_fun(), timeout()) -> value().
 do_fetch(
@@ -345,8 +329,9 @@ do_fetch(
     Expiry
 ) ->
     Hash = hash(Cache, Key),
-    case add_new(Cache, Hash) of
-        {error, already_exists} ->
+    case contains_hash(Cache, Hash) of
+        true ->
+            add_hash(Cache, Hash),
             Fingerprint = fingerprint(Hash, FingerprintSize),
             case lookup_cache(Table, Fingerprint, Key) of
                 {ok, Value} ->
@@ -356,7 +341,8 @@ do_fetch(
                     ets:insert(Table, {Fingerprint, Key, Value, Expiry}),
                     Value
             end;
-        _ ->
+        false ->
+            add_hash(Cache, Hash),
             Fallback(Key)
     end.
 
@@ -367,33 +353,19 @@ default_hash_function(_Size) ->
     fun xxh3:hash64/1.
 
 -spec lookup_index(cuckoo_cache(), non_neg_integer(), fingerprint()) -> boolean().
-lookup_index(Cache, Index, Fingerprint) ->
+lookup_index(
+    Cache = #cuckoo_cache{num_buckets = NumBuckets, hash_function = HashFunction},
+    Index,
+    Fingerprint
+) ->
     Bucket = read_bucket(Index, Cache),
     case lists:member(Fingerprint, Bucket) of
         true ->
             true;
         false ->
-            lookup_alt_index(Cache, Index, Fingerprint, Bucket)
-    end.
-
--spec lookup_alt_index(cuckoo_cache(), non_neg_integer(), fingerprint(), [fingerprint()]) ->
-    boolean().
-lookup_alt_index(
-    Cache = #cuckoo_cache{num_buckets = NumBuckets, hash_function = HashFunction},
-    Index,
-    Fingerprint,
-    Bucket
-) ->
-    AltIndex = alt_index(Index, Fingerprint, NumBuckets, HashFunction),
-    AltBucket = read_bucket(AltIndex, Cache),
-    case lists:member(Fingerprint, AltBucket) of
-        true ->
-            true;
-        false ->
-            case read_bucket(Index, Cache) of
-                Bucket -> false;
-                _ -> lookup_index(Cache, Index, Fingerprint)
-            end
+            AltIndex = alt_index(Index, Fingerprint, NumBuckets, HashFunction),
+            AltBucket = read_bucket(AltIndex, Cache),
+            lists:member(Fingerprint, AltBucket)
     end.
 
 -spec delete_fingerprint(cuckoo_cache(), fingerprint(), non_neg_integer()) ->
@@ -450,9 +422,8 @@ insert_at_index(Cache, Index, Fingerprint) ->
             {error, full}
     end.
 
--spec force_insert(cuckoo_cache(), non_neg_integer(), fingerprint()) ->
-    ok | {ok, Evicted :: fingerprint()}.
-force_insert(Cache = #cuckoo_cache{bucket_size = BucketSize}, Index, Fingerprint) ->
+-spec force_insert(cuckoo_cache(), non_neg_integer(), fingerprint()) -> ok.
+force_insert(Cache = #cuckoo_cache{table = Table, bucket_size = BucketSize}, Index, Fingerprint) ->
     Bucket = read_bucket(Index, Cache),
     SubIndex = rand:uniform(BucketSize) - 1,
     case lists:nth(SubIndex + 1, Bucket) of
@@ -463,10 +434,20 @@ force_insert(Cache = #cuckoo_cache{bucket_size = BucketSize}, Index, Fingerprint
                 {error, full} ->
                     force_insert(Cache, Index, Fingerprint)
             end;
+        Fingerprint ->
+            ok;
         Evicted ->
             case update_in_bucket(Cache, Index, SubIndex, Evicted, Fingerprint) of
-                ok -> {ok, Evicted};
-                {error, outdated} -> force_insert(Cache, Index, Fingerprint)
+                ok ->
+                    case lookup_index(Cache, Index, Evicted) of
+                        true ->
+                            ok;
+                        false ->
+                            ets:delete(Table, Evicted),
+                            ok
+                    end;
+                {error, outdated} ->
+                    force_insert(Cache, Index, Fingerprint)
             end
     end.
 
