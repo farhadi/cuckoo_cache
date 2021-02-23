@@ -1,7 +1,7 @@
 {application, cuckoo_cache, [
     {description,
         "A high-performance concurrent in-memory cache with one-hit-wonders detection for Erlang and Elixir"},
-    {vsn, "0.0.2"},
+    {vsn, "0.0.3"},
     {registered, []},
     {applications, [
         kernel,

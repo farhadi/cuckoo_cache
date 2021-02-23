@@ -45,6 +45,7 @@
 -define(DEFAULT_TTL, infinity).
 
 -define(CACHE(Name), persistent_term:get({?MODULE, Name})).
+-define(FINGERPRINT(Hash, FingerprintSize), Hash rem (1 bsl FingerprintSize - 1) + 1).
 -define(NOW, erlang:monotonic_time(millisecond)).
 
 %% @equiv new(Capacity, [])
@@ -78,7 +79,7 @@ new(Capacity) ->
 %% </li>
 %% <li>`{fingerprint_size, FingerprintSize}'
 %% <p>This is the fingerprint size of the built-in cuckoo filter and can be
-%% one of 4, 8, 16, 32, and 64 bits. Default fingerprint size is 16 bits.</p>
+%% one of 4, 8, 16, 32, and 64 bits. Default fingerprint size is 32 bits.</p>
 %% </li>
 %% <li>`{bucket_size, BucketSize}'
 %% <p>BucketSize of the built-in cuckoo filter must be a non negative integer,
@@ -142,7 +143,7 @@ new(Capacity, Opts) ->
 -spec get(cuckoo_cache() | cache_name(), key()) -> {ok, value()} | {error, not_found}.
 get(Cache = #cuckoo_cache{table = Table, fingerprint_size = FingerprintSize}, Key) ->
     Hash = hash(Cache, Key),
-    Fingerprint = fingerprint(Hash, FingerprintSize),
+    Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
     case contains_hash(Cache, Hash) of
         true -> lookup_cache(Table, Fingerprint, Key);
         false -> {error, not_found}
@@ -210,7 +211,7 @@ fetch(Name, Key, Fallback, TTL) ->
 -spec delete(cuckoo_cache() | cache_name(), key()) -> ok | {error, not_found}.
 delete(Cache = #cuckoo_cache{table = Table, fingerprint_size = FingerprintSize}, Key) ->
     Hash = hash(Cache, Key),
-    Fingerprint = fingerprint(Hash, FingerprintSize),
+    Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
     ets:delete(Table, Fingerprint),
     delete_hash(Cache, Hash);
 delete(Name, Key) ->
@@ -316,7 +317,7 @@ do_put(
     Expiry
 ) ->
     Hash = hash(Cache, Key),
-    Fingerprint = fingerprint(Hash, FingerprintSize),
+    Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
     add_hash(Cache, Hash),
     ets:insert(Table, {Fingerprint, Key, Value, Expiry}),
     ok.
@@ -332,7 +333,7 @@ do_fetch(
     case contains_hash(Cache, Hash) of
         true ->
             add_hash(Cache, Hash),
-            Fingerprint = fingerprint(Hash, FingerprintSize),
+            Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
             case lookup_cache(Table, Fingerprint, Key) of
                 {ok, Value} ->
                     Value;
@@ -384,18 +385,9 @@ delete_fingerprint(Cache, Fingerprint, Index) ->
             {error, not_found}
     end.
 
--spec fingerprint(hash(), fingerprint()) -> fingerprint().
-fingerprint(Hash, FingerprintSize) ->
-    case Hash rem (1 bsl FingerprintSize) of
-        0 ->
-            1;
-        Fingerprint ->
-            Fingerprint
-    end.
-
 -spec index_and_fingerprint(hash(), fingerprint_size()) -> {non_neg_integer(), fingerprint()}.
 index_and_fingerprint(Hash, FingerprintSize) ->
-    Fingerprint = fingerprint(Hash, FingerprintSize),
+    Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
     Index = Hash bsr FingerprintSize,
     {Index, Fingerprint}.
 
@@ -451,7 +443,8 @@ force_insert(Cache = #cuckoo_cache{table = Table, bucket_size = BucketSize}, Ind
             end
     end.
 
--spec find_in_bucket([fingerprint()], fingerprint()) -> non_neg_integer().
+-spec find_in_bucket([fingerprint() | 0], fingerprint() | 0) ->
+    {ok, non_neg_integer()} | {error, not_found}.
 find_in_bucket(Bucket, Fingerprint) ->
     find_in_bucket(Bucket, Fingerprint, 0).
 
@@ -462,7 +455,7 @@ find_in_bucket([Fingerprint | _Bucket], Fingerprint, Index) ->
 find_in_bucket([_ | Bucket], Fingerprint, Index) ->
     find_in_bucket(Bucket, Fingerprint, Index + 1).
 
--spec read_bucket(non_neg_integer(), cuckoo_cache()) -> [fingerprint()].
+-spec read_bucket(non_neg_integer(), cuckoo_cache()) -> [fingerprint() | 0].
 read_bucket(
     Index,
     #cuckoo_cache{
@@ -486,8 +479,8 @@ read_bucket(
     cuckoo_cache(),
     non_neg_integer(),
     non_neg_integer(),
-    fingerprint(),
-    fingerprint()
+    fingerprint() | 0,
+    fingerprint() | 0
 ) -> ok | {error, outdated}.
 update_in_bucket(
     Cache = #cuckoo_cache{
