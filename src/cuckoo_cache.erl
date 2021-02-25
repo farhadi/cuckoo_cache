@@ -29,7 +29,7 @@
 -type hash_function() :: fun((binary()) -> hash()).
 -type key() :: term().
 -type value() :: term().
--type fallback_fun() :: fun((key()) -> value()).
+-type fallback_fun() :: fun((key()) -> {ok, value()} | {error, term()}).
 -type cache_name() :: term().
 -type options() :: [option()].
 -type option() ::
@@ -336,11 +336,14 @@ do_fetch(
             Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
             case lookup_cache(Table, Fingerprint, Key) of
                 {ok, Value} ->
-                    Value;
+                    {ok, Value};
                 {error, not_found} ->
-                    Value = Fallback(Key),
-                    ets:insert(Table, {Fingerprint, Key, Value, Expiry}),
-                    Value
+                    case Fallback(Key) of
+                        {ok, Value} ->
+                            ets:insert(Table, {Fingerprint, Key, Value, Expiry});
+                        Error ->
+                            Error
+                    end
             end;
         false ->
             add_hash(Cache, Hash),
