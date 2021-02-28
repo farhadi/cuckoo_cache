@@ -1,1 +1,8 @@
-[].
+{"1.2.0",
+[{<<"cuckoo_filter">>,{pkg,<<"cuckoo_filter">>,<<"0.3.0">>},0}]}.
+[
+{pkg_hash,[
+ {<<"cuckoo_filter">>, <<"A69B2BFDAB64C63E4BBDCCEB5933E2033017F698E78AB963F3468BB59672DF3A">>}]},
+{pkg_hash_ext,[
+ {<<"cuckoo_filter">>, <<"5D578DCC6A91D9597BD84D0DD31CAA3B28F5511D4140DF6755435F81DB3D2EFA">>}]}
+].

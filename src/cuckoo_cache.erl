@@ -17,6 +17,7 @@
     size/1
 ]).
 
+-include_lib("cuckoo_filter/src/cuckoo_filter.hrl").
 -include("cuckoo_cache.hrl").
 
 -type cuckoo_cache() :: #cuckoo_cache{}.
@@ -41,7 +42,6 @@
 
 %% Default configurations
 -define(DEFAULT_FINGERPRINT_SIZE, 32).
--define(DEFAULT_BUCKET_SIZE, 4).
 -define(DEFAULT_TTL, infinity).
 
 -define(CACHE(Name), persistent_term:get({?MODULE, Name})).
@@ -94,21 +94,14 @@ new(Capacity) ->
 %% </ul>
 -spec new(pos_integer(), options()) -> cuckoo_cache().
 new(Capacity, Opts) ->
-    is_integer(Capacity) andalso Capacity > 0 orelse error(badarg),
-    BucketSize = proplists:get_value(bucket_size, Opts, ?DEFAULT_BUCKET_SIZE),
-    is_integer(BucketSize) andalso BucketSize > 0 orelse error(badarg),
     FingerprintSize = proplists:get_value(fingerprint_size, Opts, ?DEFAULT_FINGERPRINT_SIZE),
-    lists:member(FingerprintSize, [4, 8, 16, 32, 64]) orelse error(badarg),
     TTL = proplists:get_value(ttl, Opts, ?DEFAULT_TTL),
     (is_integer(TTL) andalso TTL > 0 orelse TTL == infinity) orelse error(badarg),
-    HashFunction = proplists:get_value(
-        hash_function,
-        Opts,
-        default_hash_function(BucketSize + FingerprintSize)
-    ),
-    NumBuckets = 1 bsl ceil(math:log2(ceil(Capacity / BucketSize))),
-    MaxHash = NumBuckets bsl FingerprintSize - 1,
-    AtomicsSize = ceil(NumBuckets * BucketSize * FingerprintSize / 64) + 1,
+
+    Opts1 = lists:keystore(fingerprint_size, 1, Opts, {fingerprint_size, FingerprintSize}),
+    Opts2 = lists:keystore(max_evictions, 1, Opts1, {max_evictions, 0}),
+    Opts3 = lists:keydelete(name, 1, Opts2),
+    Filter = cuckoo_filter:new(Capacity, Opts3),
 
     Table = ets:new(?MODULE, [
         ordered_set,
@@ -120,12 +113,7 @@ new(Capacity, Opts) ->
     CuckooCache = #cuckoo_cache{
         table = Table,
         ttl = TTL,
-        buckets = atomics:new(AtomicsSize, [{signed, false}]),
-        num_buckets = NumBuckets,
-        max_hash = MaxHash,
-        bucket_size = BucketSize,
-        fingerprint_size = FingerprintSize,
-        hash_function = HashFunction
+        filter = Filter
     },
 
     case proplists:get_value(name, Opts) of
@@ -141,10 +129,16 @@ new(Capacity, Opts) ->
 %% If entry exists in the cache `{ok, Value}' is returned, otherwise
 %% `{error, not_found}' is returned.
 -spec get(cuckoo_cache() | cache_name(), key()) -> {ok, value()} | {error, not_found}.
-get(Cache = #cuckoo_cache{table = Table, fingerprint_size = FingerprintSize}, Key) ->
-    Hash = hash(Cache, Key),
+get(
+    #cuckoo_cache{
+        table = Table,
+        filter = Filter = #cuckoo_filter{fingerprint_size = FingerprintSize}
+    },
+    Key
+) ->
+    Hash = cuckoo_filter:hash(Filter, Key),
     Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
-    case contains_hash(Cache, Hash) of
+    case cuckoo_filter:contains_hash(Filter, Hash) of
         true -> lookup_cache(Table, Fingerprint, Key);
         false -> {error, not_found}
     end;
@@ -209,25 +203,31 @@ fetch(Name, Key, Fallback, TTL) ->
 %% Returns `ok' if the deletion was successful, and returns {error, not_found}
 %% if the element could not be found in the cuckoo filter.
 -spec delete(cuckoo_cache() | cache_name(), key()) -> ok | {error, not_found}.
-delete(Cache = #cuckoo_cache{table = Table, fingerprint_size = FingerprintSize}, Key) ->
-    Hash = hash(Cache, Key),
+delete(
+    #cuckoo_cache{
+        table = Table,
+        filter = Filter = #cuckoo_filter{fingerprint_size = FingerprintSize}
+    },
+    Key
+) ->
+    Hash = cuckoo_filter:hash(Filter, Key),
     Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
     ets:delete(Table, Fingerprint),
-    delete_hash(Cache, Hash);
+    cuckoo_filter:delete_hash(Filter, Hash);
 delete(Name, Key) ->
     delete(?CACHE(Name), Key).
 
 %% @doc Returns the maximum capacity of the cuckoo filter in a cache.
 -spec capacity(cuckoo_cache() | cache_name()) -> pos_integer().
-capacity(#cuckoo_cache{bucket_size = BucketSize, num_buckets = NumBuckets}) ->
-    NumBuckets * BucketSize;
+capacity(#cuckoo_cache{filter = Filter}) ->
+    cuckoo_filter:capacity(Filter);
 capacity(Name) ->
     capacity(?CACHE(Name)).
 
 %% @doc Returns number of items in the cuckoo filter of a cache.
 -spec filter_size(cuckoo_cache() | cache_name()) -> non_neg_integer().
-filter_size(#cuckoo_cache{buckets = Buckets}) ->
-    atomics:get(Buckets, 1);
+filter_size(#cuckoo_cache{filter = Filter}) ->
+    cuckoo_filter:size(Filter);
 filter_size(Name) ->
     filter_size(?CACHE(Name)).
 
@@ -241,59 +241,6 @@ size(Name) ->
 %%%-------------------------------------------------------------------
 %% Internal functions
 %%%-------------------------------------------------------------------
-
--spec add_hash(cuckoo_cache(), hash()) -> ok.
-add_hash(
-    Cache = #cuckoo_cache{
-        fingerprint_size = FingerprintSize,
-        num_buckets = NumBuckets,
-        hash_function = HashFunction
-    },
-    Hash
-) ->
-    {Index, Fingerprint} = index_and_fingerprint(Hash, FingerprintSize),
-    case insert_at_index(Cache, Index, Fingerprint) of
-        ok ->
-            ok;
-        {error, full} ->
-            AltIndex = alt_index(Index, Fingerprint, NumBuckets, HashFunction),
-            case insert_at_index(Cache, AltIndex, Fingerprint) of
-                ok ->
-                    ok;
-                {error, full} ->
-                    RandIndex = element(rand:uniform(2), {Index, AltIndex}),
-                    force_insert(Cache, RandIndex, Fingerprint)
-            end
-    end.
-
--spec contains_hash(cuckoo_cache(), hash()) -> boolean().
-contains_hash(Cache = #cuckoo_cache{fingerprint_size = FingerprintSize}, Hash) ->
-    {Index, Fingerprint} = index_and_fingerprint(Hash, FingerprintSize),
-    lookup_index(Cache, Index, Fingerprint).
-
--spec delete_hash(cuckoo_cache(), hash()) -> ok | {error, not_found}.
-delete_hash(
-    Cache = #cuckoo_cache{
-        fingerprint_size = FingerprintSize,
-        num_buckets = NumBuckets,
-        hash_function = HashFunction
-    },
-    Hash
-) ->
-    {Index, Fingerprint} = index_and_fingerprint(Hash, FingerprintSize),
-    case delete_fingerprint(Cache, Fingerprint, Index) of
-        ok ->
-            ok;
-        {error, not_found} ->
-            AltIndex = alt_index(Index, Fingerprint, NumBuckets, HashFunction),
-            delete_fingerprint(Cache, Fingerprint, AltIndex)
-    end.
-
--spec hash(cuckoo_cache(), key()) -> hash().
-hash(#cuckoo_cache{max_hash = MaxHash, hash_function = HashFunction}, Key) when is_binary(Key) ->
-    HashFunction(Key) band MaxHash;
-hash(Cache, Key) ->
-    hash(Cache, term_to_binary(Key)).
 
 -spec lookup_cache(ets:tid(), fingerprint(), key()) -> {ok, value()} | {error, not_found}.
 lookup_cache(Table, Fingerprint, Key) ->
@@ -309,30 +256,51 @@ lookup_cache(Table, Fingerprint, Key) ->
             {error, not_found}
     end.
 
+-spec add_to_filter(cuckoo_cache(), hash()) -> ok.
+add_to_filter(#cuckoo_cache{table = Table, filter = Filter}, Hash) ->
+    case cuckoo_filter:add_hash(Filter, Hash, force) of
+        ok ->
+            ok;
+        {ok, {Index, Evicted}} ->
+            case cuckoo_filter:contains_fingerprint(Filter, Index, Evicted) of
+                true ->
+                    ok;
+                false ->
+                    ets:delete(Table, Evicted),
+                    ok
+            end
+    end.
+
 -spec do_put(cuckoo_cache(), key(), value(), timeout()) -> ok.
 do_put(
-    Cache = #cuckoo_cache{table = Table, fingerprint_size = FingerprintSize},
+    Cache = #cuckoo_cache{
+        table = Table,
+        filter = Filter = #cuckoo_filter{fingerprint_size = FingerprintSize}
+    },
     Key,
     Value,
     Expiry
 ) ->
-    Hash = hash(Cache, Key),
+    Hash = cuckoo_filter:hash(Filter, Key),
     Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
-    add_hash(Cache, Hash),
+    add_to_filter(Cache, Hash),
     ets:insert(Table, {Fingerprint, Key, Value, Expiry}),
     ok.
 
 -spec do_fetch(cuckoo_cache(), key(), fallback_fun(), timeout()) -> value().
 do_fetch(
-    Cache = #cuckoo_cache{table = Table, fingerprint_size = FingerprintSize},
+    Cache = #cuckoo_cache{
+        table = Table,
+        filter = Filter = #cuckoo_filter{fingerprint_size = FingerprintSize}
+    },
     Key,
     Fallback,
     Expiry
 ) ->
-    Hash = hash(Cache, Key),
-    case contains_hash(Cache, Hash) of
+    Hash = cuckoo_filter:hash(Filter, Key),
+    case cuckoo_filter:contains_hash(Filter, Hash) of
         true ->
-            add_hash(Cache, Hash),
+            add_to_filter(Cache, Hash),
             Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
             case lookup_cache(Table, Fingerprint, Key) of
                 {ok, Value} ->
@@ -340,181 +308,72 @@ do_fetch(
                 {error, not_found} ->
                     case Fallback(Key) of
                         {ok, Value} ->
-                            ets:insert(Table, {Fingerprint, Key, Value, Expiry});
+                            ets:insert(Table, {Fingerprint, Key, Value, Expiry}),
+                            {ok, Value};
                         Error ->
                             Error
                     end
             end;
         false ->
-            add_hash(Cache, Hash),
+            add_to_filter(Cache, Hash),
             Fallback(Key)
     end.
 
--spec default_hash_function(fingerprint_size()) -> hash_function().
-default_hash_function(Size) when Size > 64 ->
-    fun xxh3:hash128/1;
-default_hash_function(_Size) ->
-    fun xxh3:hash64/1.
+-ifdef(TEST).
 
--spec lookup_index(cuckoo_cache(), non_neg_integer(), fingerprint()) -> boolean().
-lookup_index(
-    Cache = #cuckoo_cache{num_buckets = NumBuckets, hash_function = HashFunction},
-    Index,
-    Fingerprint
-) ->
-    Bucket = read_bucket(Index, Cache),
-    case lists:member(Fingerprint, Bucket) of
-        true ->
-            true;
-        false ->
-            AltIndex = alt_index(Index, Fingerprint, NumBuckets, HashFunction),
-            AltBucket = read_bucket(AltIndex, Cache),
-            lists:member(Fingerprint, AltBucket)
-    end.
+-include_lib("eunit/include/eunit.hrl").
 
--spec delete_fingerprint(cuckoo_cache(), fingerprint(), non_neg_integer()) ->
-    ok | {error, not_found}.
-delete_fingerprint(Cache, Fingerprint, Index) ->
-    Bucket = read_bucket(Index, Cache),
-    case find_in_bucket(Bucket, Fingerprint) of
-        {ok, SubIndex} ->
-            case update_in_bucket(Cache, Index, SubIndex, Fingerprint, 0) of
-                ok ->
-                    ok;
-                {error, outdated} ->
-                    delete_fingerprint(Cache, Fingerprint, Index)
-            end;
-        {error, not_found} ->
-            {error, not_found}
-    end.
+new_badargs_test() ->
+    ?assertError(badarg, new(0)),
+    ?assertError(badarg, new(8, [{bucket_size, 0}])),
+    ?assertError(badarg, new(8, [{fingerprint_size, 5}])),
+    ?assertError(badarg, new(8, [{ttl, 0}])).
 
--spec index_and_fingerprint(hash(), fingerprint_size()) -> {non_neg_integer(), fingerprint()}.
-index_and_fingerprint(Hash, FingerprintSize) ->
-    Fingerprint = ?FINGERPRINT(Hash, FingerprintSize),
-    Index = Hash bsr FingerprintSize,
-    {Index, Fingerprint}.
+new_test() ->
+    Capacity = rand:uniform(1000),
+    Cache = new(Capacity),
+    RealCapacity = capacity(Cache),
+    ?assert(RealCapacity >= Capacity),
+    ?assertMatch(
+        #cuckoo_cache{
+            ttl = infinity,
+            filter = #cuckoo_filter{}
+        },
+        Cache
+    ).
 
--spec alt_index(non_neg_integer(), fingerprint(), pos_integer(), hash_function()) ->
-    non_neg_integer().
-alt_index(Index, Fingerprint, NumBuckets, HashFunction) ->
-    Index bxor HashFunction(binary:encode_unsigned(Fingerprint)) rem NumBuckets.
+put_get_delete_test() ->
+    Cache = new(rand:uniform(1000)),
+    Capacity = capacity(Cache),
+    Key = <<"my_key">>,
+    Value = 123,
+    ok = put(Cache, Key, Value),
+    ?assertMatch({ok, Value}, get(Cache, Key)),
+    ok = delete(Cache, Key),
+    Keys = lists:seq(1, Capacity),
+    [put(Cache, K, K * 2) || K <- Keys],
+    CachedKeys = [K || K <- Keys, {ok, K * 2} == get(Cache, K)],
+    ?assertEqual(length(CachedKeys), cuckoo_cache:size(Cache)),
+    ?assertEqual(length(CachedKeys), filter_size(Cache)),
+    [delete(Cache, K) || K <- Keys],
+    ?assertEqual(0, cuckoo_cache:size(Cache)),
+    ?assertEqual(0, filter_size(Cache)).
 
-atomic_index(BitIndex) ->
-    BitIndex div 64 + 2.
+fetch_test() ->
+    Cache = new(rand:uniform(1000)),
+    Capacity = capacity(Cache),
+    Keys = lists:seq(1, Capacity),
+    Fallback = fun
+        (K) when K rem 2 == 0 -> {ok, K * 2};
+        (K) -> {error, no_cache}
+    end,
+    FetchedKeys = [K || K <- Keys, {ok, K * 2} == fetch(Cache, K, Fallback)],
+    ?assertEqual(0, cuckoo_cache:size(Cache)),
+    ?assert(filter_size(Cache) =< Capacity),
+    FetchedKeys = [K || K <- Keys, {ok, K * 2} == fetch(Cache, K, Fallback)],
+    CachedKeys = [K || K <- Keys, {ok, K * 2} == get(Cache, K)],
+    ?assert(cuckoo_cache:size(Cache) > 0),
+    ?assertEqual(length(CachedKeys), cuckoo_cache:size(Cache)),
+    ?assert(cuckoo_cache:size(Cache) < filter_size(Cache)).
 
--spec insert_at_index(cuckoo_cache(), non_neg_integer(), fingerprint()) -> ok | {error, full}.
-insert_at_index(Cache, Index, Fingerprint) ->
-    Bucket = read_bucket(Index, Cache),
-    case find_in_bucket(Bucket, 0) of
-        {ok, SubIndex} ->
-            case update_in_bucket(Cache, Index, SubIndex, 0, Fingerprint) of
-                ok ->
-                    ok;
-                {error, outdated} ->
-                    insert_at_index(Cache, Index, Fingerprint)
-            end;
-        {error, not_found} ->
-            {error, full}
-    end.
-
--spec force_insert(cuckoo_cache(), non_neg_integer(), fingerprint()) -> ok.
-force_insert(Cache = #cuckoo_cache{table = Table, bucket_size = BucketSize}, Index, Fingerprint) ->
-    Bucket = read_bucket(Index, Cache),
-    SubIndex = rand:uniform(BucketSize) - 1,
-    case lists:nth(SubIndex + 1, Bucket) of
-        0 ->
-            case insert_at_index(Cache, Index, Fingerprint) of
-                ok ->
-                    ok;
-                {error, full} ->
-                    force_insert(Cache, Index, Fingerprint)
-            end;
-        Fingerprint ->
-            ok;
-        Evicted ->
-            case update_in_bucket(Cache, Index, SubIndex, Evicted, Fingerprint) of
-                ok ->
-                    case lookup_index(Cache, Index, Evicted) of
-                        true ->
-                            ok;
-                        false ->
-                            ets:delete(Table, Evicted),
-                            ok
-                    end;
-                {error, outdated} ->
-                    force_insert(Cache, Index, Fingerprint)
-            end
-    end.
-
--spec find_in_bucket([fingerprint() | 0], fingerprint() | 0) ->
-    {ok, non_neg_integer()} | {error, not_found}.
-find_in_bucket(Bucket, Fingerprint) ->
-    find_in_bucket(Bucket, Fingerprint, 0).
-
-find_in_bucket([], _Fingerprint, _Index) ->
-    {error, not_found};
-find_in_bucket([Fingerprint | _Bucket], Fingerprint, Index) ->
-    {ok, Index};
-find_in_bucket([_ | Bucket], Fingerprint, Index) ->
-    find_in_bucket(Bucket, Fingerprint, Index + 1).
-
--spec read_bucket(non_neg_integer(), cuckoo_cache()) -> [fingerprint() | 0].
-read_bucket(
-    Index,
-    #cuckoo_cache{
-        buckets = Buckets,
-        bucket_size = BucketSize,
-        fingerprint_size = FingerprintSize
-    }
-) ->
-    BucketBitSize = BucketSize * FingerprintSize,
-    BitIndex = Index * BucketBitSize,
-    AtomicIndex = atomic_index(BitIndex),
-    SkipBits = BitIndex rem 64,
-    EndIndex = atomic_index(BitIndex + BucketBitSize - 1),
-    <<_:SkipBits, Bucket:BucketBitSize/bitstring, _/bitstring>> = <<
-        <<(atomics:get(Buckets, I)):64/big-unsigned-integer>>
-     || I <- lists:seq(AtomicIndex, EndIndex)
-    >>,
-    [F || <<F:FingerprintSize/big-unsigned-integer>> <= Bucket].
-
--spec update_in_bucket(
-    cuckoo_cache(),
-    non_neg_integer(),
-    non_neg_integer(),
-    fingerprint() | 0,
-    fingerprint() | 0
-) -> ok | {error, outdated}.
-update_in_bucket(
-    Cache = #cuckoo_cache{
-        buckets = Buckets,
-        bucket_size = BucketSize,
-        fingerprint_size = FingerprintSize
-    },
-    Index,
-    SubIndex,
-    OldValue,
-    Value
-) ->
-    BitIndex = Index * BucketSize * FingerprintSize + SubIndex * FingerprintSize,
-    AtomicIndex = atomic_index(BitIndex),
-    SkipBits = BitIndex rem 64,
-    AtomicValue = atomics:get(Buckets, AtomicIndex),
-    case <<AtomicValue:64/big-unsigned-integer>> of
-        <<Prefix:SkipBits/bitstring, OldValue:FingerprintSize/big-unsigned-integer,
-            Suffix/bitstring>> ->
-            <<UpdatedAtomic:64/big-unsigned-integer>> =
-                <<Prefix/bitstring, Value:FingerprintSize/big-unsigned-integer, Suffix/bitstring>>,
-            case atomics:compare_exchange(Buckets, AtomicIndex, AtomicValue, UpdatedAtomic) of
-                ok ->
-                    case {OldValue, Value} of
-                        {0, _} -> atomics:add(Buckets, 1, 1);
-                        {_, 0} -> atomics:sub(Buckets, 1, 1);
-                        {_, _} -> ok
-                    end;
-                _ ->
-                    update_in_bucket(Cache, Index, SubIndex, OldValue, Value)
-            end;
-        _ ->
-            {error, outdated}
-    end.
+-endif.
