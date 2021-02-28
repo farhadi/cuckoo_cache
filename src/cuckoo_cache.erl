@@ -365,15 +365,36 @@ fetch_test() ->
     Keys = lists:seq(1, Capacity),
     Fallback = fun
         (K) when K rem 2 == 0 -> {ok, K * 2};
-        (K) -> {error, no_cache}
+        (_) -> {error, no_cache}
     end,
     FetchedKeys = [K || K <- Keys, {ok, K * 2} == fetch(Cache, K, Fallback)],
     ?assertEqual(0, cuckoo_cache:size(Cache)),
     ?assert(filter_size(Cache) =< Capacity),
+    ?assert(filter_size(Cache) > 0),
     FetchedKeys = [K || K <- Keys, {ok, K * 2} == fetch(Cache, K, Fallback)],
-    CachedKeys = [K || K <- Keys, {ok, K * 2} == get(Cache, K)],
+    CachedKeys = [
+        K
+     || K <- Keys, {ok, K * 2} == fetch(Cache, K, fun(_) -> {error, no_fallback} end)
+    ],
     ?assert(cuckoo_cache:size(Cache) > 0),
-    ?assertEqual(length(CachedKeys), cuckoo_cache:size(Cache)),
+    ?assert(length(CachedKeys) >= cuckoo_cache:size(Cache)),
     ?assert(cuckoo_cache:size(Cache) < filter_size(Cache)).
+
+frequently_accessed_items_test() ->
+    Cache = new(100 + rand:uniform(1000)),
+    Capacity = capacity(Cache),
+    Keys0 =
+        lists:seq(1, Capacity div 8) ++
+            lists:seq(1, Capacity div 4) ++
+            lists:seq(1, Capacity div 2),
+    Keys1 = Keys0 ++ Keys0 ++ Keys0 ++ lists:seq(1, Capacity * 10),
+    Keys = [K || {_, K} <- lists:sort([{rand:uniform(), K} || K <- Keys1])],
+    Fallback = fun(K) -> {ok, K * 2} end,
+    [K || K <- Keys, {ok, K * 2} == fetch(Cache, K, Fallback)],
+    CachedKeys = [K || K <- lists:seq(1, Capacity * 5), {ok, K * 2} == get(Cache, K)],
+    ?assertEqual(Capacity, filter_size(Cache)),
+    ?assertEqual(length(CachedKeys), cuckoo_cache:size(Cache)),
+    ?assert(Capacity div 8 > cuckoo_cache:size(Cache)),
+    ?assert(lists:sum(CachedKeys) / length(CachedKeys) < Capacity div 4).
 
 -endif.
