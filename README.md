@@ -1,5 +1,7 @@
 # Cuckoo Cache
 
+[![CI build status](https://github.com/farhadi/cuckoo_cache/workflows/CI/badge.svg)](https://github.com/farhadi/cuckoo_cache/actions?query=workflow%3ACI)
+[![codecov](https://codecov.io/gh/farhadi/cuckoo_cache/branch/main/graph/badge.svg)](https://codecov.io/gh/farhadi/cuckoo_cache)
 [![Hex docs](http://img.shields.io/badge/hex.pm-docs-green.svg?style=flat)](https://hexdocs.pm/cuckoo_cache)
 [![Hex Version](http://img.shields.io/hexpm/v/cuckoo_cache.svg?style=flat)](https://hex.pm/packages/cuckoo_cache)
 [![License](http://img.shields.io/hexpm/l/cuckoo_cache.svg?style=flat)](https://github.com/farhadi/cuckoo_cache/blob/main/LICENSE)
