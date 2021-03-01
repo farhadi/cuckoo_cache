@@ -413,6 +413,36 @@ frequently_accessed_items_test() ->
     ?assert(Capacity div 8 > cuckoo_cache:size(Cache)),
     ?assert(lists:sum(CachedKeys) / length(CachedKeys) < Capacity div 4).
 
+concurrent_test() ->
+    Cache = new(100 + rand:uniform(1000)),
+    Capacity = capacity(Cache),
+    Counter = counters:new(2, []),
+    Fallback = fun(I) ->
+        if
+            I < Capacity div 8 ->
+                % update number of cache misses for frequent keys
+                counters:add(Counter, 1, 1);
+            true ->
+                % update number of cache misses for less frequent keys
+                counters:add(Counter, 2, 1)
+        end,
+        {ok, I}
+    end,
+    FrequentKeys = [rand:uniform(Capacity div 8) || I <- lists:seq(1, Capacity * 100)],
+    LessFrequentKeys = [
+        Capacity div 8 + rand:uniform(Capacity * 10)
+     || I <- lists:seq(1, Capacity * 100)
+    ],
+    {Pid, Ref} = spawn_monitor(fun() ->
+        [cuckoo_cache:fetch(Cache, I, Fallback) || I <- FrequentKeys]
+    end),
+    [cuckoo_cache:fetch(Cache, I, Fallback) || I <- LessFrequentKeys],
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    end,
+    ?assert(cuckoo_cache:size(Cache) < Capacity div 4),
+    ?assert(counters:get(Counter, 1) * 10 < counters:get(Counter, 2)).
+
 named_cache_test() ->
     Name = named_cache,
     Capacity = rand:uniform(1000),
