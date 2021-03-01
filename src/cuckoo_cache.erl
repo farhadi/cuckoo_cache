@@ -14,7 +14,8 @@
     delete/2,
     capacity/1,
     filter_size/1,
-    size/1
+    size/1,
+    whereis/1
 ]).
 
 -include_lib("cuckoo_filter/src/cuckoo_filter.hrl").
@@ -238,6 +239,11 @@ size(#cuckoo_cache{table = Table}) ->
 size(Name) ->
     cuckoo_cache:size(?CACHE(Name)).
 
+%% @doc Retrieves a cuckoo_cache from persistent_term by its name.
+-spec whereis(cache_name()) -> cuckoo_cache().
+whereis(Name) ->
+    ?CACHE(Name).
+
 %%%-------------------------------------------------------------------
 %% Internal functions
 %%%-------------------------------------------------------------------
@@ -359,6 +365,16 @@ put_get_delete_test() ->
     ?assertEqual(0, cuckoo_cache:size(Cache)),
     ?assertEqual(0, filter_size(Cache)).
 
+ttl_test() ->
+    Cache = new(rand:uniform(1000)),
+    Key = <<"my_key">>,
+    Value = 123,
+    TTL = 3,
+    ok = put(Cache, Key, Value, TTL),
+    ?assertMatch({ok, Value}, get(Cache, Key)),
+    timer:sleep(TTL),
+    ?assertMatch({error, not_found}, get(Cache, Key)).
+
 fetch_test() ->
     Cache = new(rand:uniform(1000)),
     Capacity = capacity(Cache),
@@ -396,5 +412,25 @@ frequently_accessed_items_test() ->
     ?assertEqual(length(CachedKeys), cuckoo_cache:size(Cache)),
     ?assert(Capacity div 8 > cuckoo_cache:size(Cache)),
     ?assert(lists:sum(CachedKeys) / length(CachedKeys) < Capacity div 4).
+
+named_cache_test() ->
+    Name = named_cache,
+    Capacity = rand:uniform(1000),
+    Cache = new(Capacity, [{name, Name}]),
+    Key = <<"my_key">>,
+    Value = 123,
+    TTL = 1000,
+    Fallback = fun(_) -> {ok, Value} end,
+    ?assertEqual(cuckoo_cache:whereis(Name), Cache),
+    ?assertEqual(ok, put(Name, Key, Value)),
+    ?assertEqual(ok, put(Name, Key, Value, TTL)),
+    ?assertEqual({ok, Value}, get(Name, Key)),
+    ?assertEqual(ok, delete(Name, Key)),
+    ?assertEqual({error, not_found}, get(Name, Key)),
+    ?assertEqual({ok, Value}, fetch(Name, Key, Fallback)),
+    ?assertEqual({ok, Value}, fetch(Name, Key, Fallback, TTL)),
+    ?assertEqual(3, filter_size(Name)),
+    ?assertEqual(1, cuckoo_cache:size(Name)),
+    ?assert(capacity(Name) >= Capacity).
 
 -endif.
