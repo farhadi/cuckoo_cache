@@ -325,6 +325,10 @@ do_fetch(
             Fallback(Key)
     end.
 
+%%%-------------------------------------------------------------------
+%% Unit tests
+%%%-------------------------------------------------------------------
+
 -ifdef(TEST).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -428,10 +432,10 @@ concurrent_test() ->
         end,
         {ok, I}
     end,
-    FrequentKeys = [rand:uniform(Capacity div 8) || I <- lists:seq(1, Capacity * 100)],
+    FrequentKeys = [rand:uniform(Capacity div 8) || _ <- lists:seq(1, Capacity * 100)],
     LessFrequentKeys = [
         Capacity div 8 + rand:uniform(Capacity * 10)
-     || I <- lists:seq(1, Capacity * 100)
+     || _ <- lists:seq(1, Capacity * 100)
     ],
     {Pid, Ref} = spawn_monitor(fun() ->
         [cuckoo_cache:fetch(Cache, I, Fallback) || I <- FrequentKeys]
