@@ -12,7 +12,7 @@ for Erlang and Elixir.
 
 # Introduction
 
-I call it a probabilistic cache because it relys on probablistic features of
+I call it a probabilistic cache because it relies on probabilistic features of
 its underlying Cuckoo Filter. There is a high chance that most recently/frequently
 used items will remain in the cache and least recently/frequently used items are
 either not cached at all or removed lazily to give space to recently/frequently
